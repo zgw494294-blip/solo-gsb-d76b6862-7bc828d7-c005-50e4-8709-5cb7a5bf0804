@@ -72,7 +72,7 @@ python app.py
 - 手动 `POST /terminate` 会**取消脚本**（停止后续动作）并 SIGKILL 终止进程，结果记为「已取消」；
 - 发送阻塞（如超过管道容量的长行等待子进程读取）同样受**总时限**与**终止**控制；
 - **成功**：全部步骤完成且进程退出码为 0；
-- **失败**：总时限超时、写入失败、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步）与原因，并终止尚存进程；
+- **失败**：总时限超时、写入失败（含孤立代理等无法 UTF-8 编码的行）、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步）与原因，并终止尚存进程；
 - 结果与重跑都等到**输出排空、进程回收、脚本停止**之后：结果通过 `/events` 中 `stream: "auto"` 的事件公布（`phase: "step"` 为步骤进展，`phase: "result"` 为最终结果），此前槽位不释放；旧脚本只持有旧运行对象，操作不到新运行。
 
 ### 可执行样例
@@ -178,6 +178,65 @@ curl -s "localhost:8000/events?run_id=$RUN&after=0"
 - 发送尚在等待时点击「终止」，子进程被立即 SIGKILL，等待中的发送按约定返回 409 结束；
 - 发送成功后点击「关闭标准输入 (EOF)」，该行完整送达后 EOF 才生效，此后再写入返回 409；
 - 运行结束后两路输出先排空、进程回收，再公布退出码并允许重跑。
+
+## 发送异常复现与重跑（回归验证）
+
+要发送的单行若含**孤立代理字符**（lone surrogate，在 JSON 中以转义形式出现，如 `"\ud800"`），无法编码为 UTF-8。修复前脚本线程会因编码异常直接退出：结果始终为空，子进程与单运行槽位无人回收，超时或「终止」后槽位也不释放，再也无法重跑。修复后该步骤按发送失败处理：标记当前步骤失败（`index` 从 0 开始，附原因）、停止后续动作、终止尚存进程，排空输出并回收进程后才公布一次失败结果、释放槽位。
+
+复现步骤（服务已启动，见上文「启动」）：
+
+1. 启动自动对话：程序打印 `READY` 后阻塞在读输入（不会自行退出）；步骤等待 `READY`、发送孤立代理单行、再等待永远收不到的 `GOT`：
+
+   ```bash
+   RUN=$(curl -s localhost:8000/auto -H 'Content-Type: application/json' -d '{
+     "code": "import sys\nprint(\"READY\", flush=True)\nline = sys.stdin.readline()\nprint(\"GOT \" + line.strip(), flush=True)",
+     "steps": [
+       {"action": "wait", "stream": "stdout", "text": "READY"},
+       {"action": "send", "line": "\ud800"},
+       {"action": "wait", "stream": "stdout", "text": "GOT"}
+     ],
+     "timeout": 30
+   }' | python3 -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
+   ```
+
+2. 轮询事件，直到出现 `stream=auto`、`phase=result` 的失败事件：
+
+   ```bash
+   curl -s "localhost:8000/events?run_id=$RUN&after=0"
+   ```
+
+   预期行为：
+
+   - 步骤进展停在第 2 步（`index: 1`，从 0 开始），后续「等待 `GOT`」不再执行；
+   - 子进程被 SIGKILL 终止（`exit_code: -9`）；stdout/stderr 排空、进程回收（`meta` 退出事件在先）之后，才公布**一次**失败结果：
+
+     ```json
+     {"phase": "result", "state": "failed", "index": 1, "total": 3,
+      "reason": "写入失败：行内容无法编码为 UTF-8（含孤立代理字符）", "exit_code": -9}
+     ```
+
+   - 即使进程恰在发送失败后自行正常退出（退出码 0），结果仍为失败，不会改判成功。
+
+3. 槽位已释放，可立即重跑：
+
+   ```bash
+   curl -s localhost:8000/status        # busy 为 false
+
+   # 把孤立代理换成正常行重跑：返回新 run_id，最终成功
+   RUN2=$(curl -s localhost:8000/auto -H 'Content-Type: application/json' -d '{
+     "code": "import sys\nprint(\"READY\", flush=True)\nline = sys.stdin.readline()\nprint(\"GOT \" + line.strip(), flush=True)",
+     "steps": [
+       {"action": "wait", "stream": "stdout", "text": "READY"},
+       {"action": "send", "line": "hello"},
+       {"action": "wait", "stream": "stdout", "text": "GOT hello"}
+     ],
+     "timeout": 30
+   }' | python3 -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
+   curl -s "localhost:8000/events?run_id=$RUN2&after=0"
+   # 预期结果事件：{"phase": "result", "state": "success", "index": null, "total": 3, "exit_code": 0}
+   ```
+
+   旧运行的脚本线程已随结果公布停止，只持有旧运行对象，影响不到新运行。
 
 ## 接口
 
