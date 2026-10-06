@@ -72,7 +72,7 @@ python app.py
 - 手动 `POST /terminate` 会**取消脚本**（停止后续动作）并 SIGKILL 终止进程，结果记为「已取消」；
 - 发送阻塞（如超过管道容量的长行等待子进程读取）同样受**总时限**与**终止**控制；
 - **成功**：全部步骤完成且进程退出码为 0；
-- **失败**：总时限超时、写入失败、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步）与原因，并终止尚存进程；
+- **失败**：总时限超时、写入失败（含孤立代理项等无法 UTF-8 编码的行）、进程非零退出，或输出排空后仍有未完成步骤——结果注明失败位置（第几步，从 0 开始的 `index`）与原因，并终止尚存进程；
 - 结果与重跑都等到**输出排空、进程回收、脚本停止**之后：结果通过 `/events` 中 `stream: "auto"` 的事件公布（`phase: "step"` 为步骤进展，`phase: "result"` 为最终结果），此前槽位不释放；旧脚本只持有旧运行对象，操作不到新运行。
 
 ### 可执行样例
@@ -178,6 +178,51 @@ curl -s "localhost:8000/events?run_id=$RUN&after=0"
 - 发送尚在等待时点击「终止」，子进程被立即 SIGKILL，等待中的发送按约定返回 409 结束；
 - 发送成功后点击「关闭标准输入 (EOF)」，该行完整送达后 EOF 才生效，此后再写入返回 409；
 - 运行结束后两路输出先排空、进程回收，再公布退出码并允许重跑。
+
+## 发送异常复现与重跑（回归验证）
+
+自动对话的 `send` 步骤遇到**无法编码为 UTF-8 的行**（例如 JSON 转义 `\ud800` 表示的孤立代理项）时，发送动作失败。修复前驱动线程会因编码异常直接退出：最终结果事件始终不公布，子进程残留，超时或终止后槽位也不释放，无法重跑。
+
+复现步骤（服务已启动）：
+
+1. 启动自动对话：程序输出 `READY` 后等待一行输入；步骤为等待 `READY` 再发送孤立代理项单行（注意 `line` 里是 JSON 转义 `\ud800`，共 6 个字符）：
+
+   ```bash
+   RUN=$(curl -s localhost:8000/auto -H 'Content-Type: application/json' -d '{
+     "code": "import sys\nprint(\"READY\", flush=True)\nline = sys.stdin.readline()\nprint(\"GOT \" + line, flush=True)",
+     "steps": [
+       {"action": "wait", "stream": "stdout", "text": "READY"},
+       {"action": "send", "line": "\ud800"},
+       {"action": "wait", "stream": "stdout", "text": "GOT"}
+     ],
+     "timeout": 30
+   }' | python3 -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
+   ```
+
+2. 轮询事件，直到出现 `stream=auto`、`phase=result` 的最终结果：
+
+   ```bash
+   curl -s "localhost:8000/events?run_id=$RUN&after=0"
+   ```
+
+修复后的预期行为：
+
+- 第 2 步（从 0 开始的 `index: 1`）发送失败，后续步骤不再执行；结果事件为 `state: "failed"`，`reason` 为「写入失败：该行包含无法编码为 UTF-8 的字符」，`exit_code` 一并给出；
+- 尚存的子进程被 SIGKILL 终止，stdout/stderr 排空、进程回收、脚本停止之后，结果事件才公布一次；即使进程恰好正常退出（退出码 0），结果仍为失败，不改判成功；
+- 结果公布后槽位释放：`curl -s localhost:8000/status` 返回 `busy: false`，旧 `run_id` 随之失效（409）；
+- 可立即重跑：再次 `POST /auto` 返回新的 `run_id`。把 `line` 换成普通文本即可看到成功结果：
+
+  ```bash
+  curl -s localhost:8000/auto -H 'Content-Type: application/json' -d '{
+    "code": "import sys\nprint(\"READY\", flush=True)\nline = sys.stdin.readline()\nprint(\"GOT \" + line, flush=True)",
+    "steps": [
+      {"action": "wait", "stream": "stdout", "text": "READY"},
+      {"action": "send", "line": "hello"},
+      {"action": "wait", "stream": "stdout", "text": "GOT hello"}
+    ],
+    "timeout": 30
+  }'
+  ```
 
 ## 接口
 

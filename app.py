@@ -13,9 +13,10 @@
   内容都参与匹配；脚本只读取、不消费页面事件流。自动运行占用同一单
   运行槽位：期间手动输入与 EOF 返回 409，手动终止取消脚本、停止后续
   动作；发送阻塞同样受总时限与终止控制。全部步骤完成且退出码为 0 才
-  成功；超时、写入失败、非零退出或排空后仍有未完成步骤时失败，注明
-  失败位置与原因并终止尚存进程。结果公布与重跑都等到输出排空、进程
-  回收、脚本停止之后；旧脚本只持有旧运行对象，操作不到新运行。
+  成功；超时、写入失败（含孤立代理项等无法 UTF-8 编码的行）、非零
+  退出或排空后仍有未完成步骤时失败，注明失败位置与原因并终止尚存
+  进程。结果公布与重跑都等到输出排空、进程回收、脚本停止之后；
+  旧脚本只持有旧运行对象，操作不到新运行。
 - 全站同时仅一个未结束运行；旧 run_id 对新进程一律无效。
 - 正常退出与主动终止（SIGKILL，不等程序自行退出）都会先排空两路输出、
   回收进程，之后才公布退出码并允许重跑。
@@ -152,9 +153,13 @@ class Run:
         成功返回 None，失败返回错误信息。超过管道容量的长行会阻塞到
         子进程开始读取；阻塞期间只持有 stdin_lock，输出泵与 /events
         照常工作。子进程退出或被杀死时，阻塞的写会以 BrokenPipeError
-        解除，按约定转为拒绝。
+        解除，按约定转为拒绝。含孤立代理项等无法 UTF-8 编码的字符时
+        不抛异常，按发送失败返回错误信息。
         """
-        payload = (line + "\n").encode("utf-8")
+        try:
+            payload = (line + "\n").encode("utf-8")
+        except UnicodeEncodeError:
+            return "该行包含无法编码为 UTF-8 的字符"
         with self.stdin_lock:
             with self.cond:
                 if self.state != STATE_RUNNING:
@@ -180,9 +185,13 @@ class Run:
 
         把管道切为非阻塞后循环写：管道满时在 select 上短暂等待，每轮
         都检查取消事件与总时限，因此手动终止或超时都能及时打断发送；
-        整行连同末尾换行仍然完整送达，不截断。
+        整行连同末尾换行仍然完整送达，不截断。含孤立代理项等无法
+        UTF-8 编码的字符时不抛异常，按发送失败返回错误信息。
         """
-        payload = (line + "\n").encode("utf-8")
+        try:
+            payload = (line + "\n").encode("utf-8")
+        except UnicodeEncodeError:
+            return "该行包含无法编码为 UTF-8 的字符"
         with self.stdin_lock:
             with self.cond:
                 if self.state != STATE_RUNNING:
@@ -332,44 +341,52 @@ class AutoScript:
         failure = None              # (步骤下标或 None, 原因)
         cancelled = False
         at = None                   # 取消时所在步骤（None 表示退出等待阶段）
-        for i, step in enumerate(self.steps):
-            at = i
-            action = step["action"]
-            err = None
-            if action == "wait":
-                err = self._wait_text(i, step["stream"], step["text"])
-            elif action == "send":
-                line = step["line"]
-                self._progress(i, "发送单行「%s」" % self._shown(line))
-                if self.cancel_event.is_set():
-                    err = "已取消"
-                else:
-                    err = run.write_line_auto(line, self.deadline,
-                                              self.cancel_event)
-                    if err is not None and err != "已取消":
-                        err = "写入失败：" + err
-            else:                   # action == "close"
-                self._progress(i, "关闭标准输入（EOF）")
-                if self.cancel_event.is_set():
-                    err = "已取消"
-                else:
-                    run.close_stdin()
-            if err is not None:
-                # 取消优先于失败：终止与超时/写入失败同时发生时记为取消
-                if self.cancel_event.is_set():
-                    cancelled = True
-                else:
-                    failure = (i, err)
-                break
-        if not cancelled and failure is None:
-            at = None
-            self._progress(None, "全部步骤完成，等待进程退出")
-            err = self._await_exit()
-            if err is not None:
-                if self.cancel_event.is_set():
-                    cancelled = True
-                else:
-                    failure = (None, err)
+        try:
+            for i, step in enumerate(self.steps):
+                at = i
+                action = step["action"]
+                err = None
+                if action == "wait":
+                    err = self._wait_text(i, step["stream"], step["text"])
+                elif action == "send":
+                    line = step["line"]
+                    self._progress(i, "发送单行「%s」" % self._shown(line))
+                    if self.cancel_event.is_set():
+                        err = "已取消"
+                    else:
+                        err = run.write_line_auto(line, self.deadline,
+                                                  self.cancel_event)
+                        if err is not None and err != "已取消":
+                            err = "写入失败：" + err
+                else:                   # action == "close"
+                    self._progress(i, "关闭标准输入（EOF）")
+                    if self.cancel_event.is_set():
+                        err = "已取消"
+                    else:
+                        run.close_stdin()
+                if err is not None:
+                    # 取消优先于失败：终止与超时/写入失败同时发生时记为取消
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                    else:
+                        failure = (i, err)
+                    break
+            if not cancelled and failure is None:
+                at = None
+                self._progress(None, "全部步骤完成，等待进程退出")
+                err = self._await_exit()
+                if err is not None:
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                    else:
+                        failure = (None, err)
+        except Exception as exc:
+            # 发送等动作抛出未预期异常时，驱动线程不得空结果退出：
+            # 按当前步骤失败走同一收尾流程，保证终止进程、公布结果、释放槽位
+            if self.cancel_event.is_set():
+                cancelled = True
+            else:
+                failure = (at, "脚本内部错误：%s" % (exc,))
         if cancelled or failure is not None:
             # 终止尚存进程（已退出的忽略），并等输出排空、进程回收
             try:
